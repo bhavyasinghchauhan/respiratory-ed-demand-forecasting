@@ -1,70 +1,83 @@
-import warnings
-warnings.filterwarnings("ignore")
-
 import os
-import requests
+import warnings
+
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-
-from sklearn.metrics import (
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score,
-    confusion_matrix,
-    accuracy_score,
-    precision_score,
-    recall_score,
-    roc_curve,
-    roc_auc_score,
-)
-from sklearn.ensemble import GradientBoostingRegressor
+import requests
+import streamlit as st
 import statsmodels.api as sm
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+    r2_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
 from statsmodels.tsa.seasonal import seasonal_decompose
 
-# Prophet optional
+warnings.filterwarnings("ignore")
+
+
+# Optional dependency: Prophet
 try:
     from prophet import Prophet
+
     PROPHET_AVAILABLE = True
 except Exception:
     PROPHET_AVAILABLE = False
 
-# =====================================================
-# 🔐 Hardcoded Delphi API Key
-# =====================================================
-DELPHI_EPIDATA_KEY = "551821194a0d5"
 
-# =====================================================
-# CONFIG
-# =====================================================
+# -------------------------------------------------------------------
+# App config / constants
+# -------------------------------------------------------------------
 st.set_page_config(page_title="Respiratory ED Forecasting Dashboard", layout="wide")
 st.title("Respiratory ED Forecasting Dashboard")
 
-# =====================================================
-# HELPERS
-# =====================================================
+# Prefer secrets/env, but keep fallback to avoid breaking current runs.
+DEFAULT_DELPHI_KEY = "551821194a0d5"
+DELPHI_EPIDATA_KEY = (
+    st.secrets.get("DELPHI_EPIDATA_KEY")
+    if hasattr(st, "secrets")
+    else None
+) or os.getenv("DELPHI_EPIDATA_KEY") or DEFAULT_DELPHI_KEY
+
+
+# -------------------------------------------------------------------
+# Utility helpers
+# -------------------------------------------------------------------
 def safe_to_datetime(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, dayfirst=True, errors="coerce")
+
 
 def epiweek_from_date(d: pd.Timestamp) -> int:
     return int(pd.Timestamp(d).strftime("%G%V"))
 
+
 def epiweek_to_date(epiweek: int) -> pd.Timestamp:
     s = str(int(epiweek))
-    y = int(s[:4]); w = int(s[4:])
+    y = int(s[:4])
+    w = int(s[4:])
     return pd.to_datetime(f"{y}-W{w:02d}-7", format="%G-W%V-%u")
 
-def ensure_weekly(df: pd.DataFrame, date_col="Date") -> pd.DataFrame:
+
+def ensure_weekly(df: pd.DataFrame, date_col: str = "Date") -> pd.DataFrame:
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=[date_col]).sort_values(date_col)
     df = df.set_index(date_col).asfreq("W-SUN")
     return df.reset_index()
 
+
 def clamp_date(d: pd.Timestamp, lo: pd.Timestamp, hi: pd.Timestamp) -> pd.Timestamp:
     return min(max(d, lo), hi)
+
 
 def rmsle_safe(y_true, y_pred) -> float:
     y_true = np.asarray(y_true, dtype=float)
@@ -73,16 +86,21 @@ def rmsle_safe(y_true, y_pred) -> float:
     y_pred = np.clip(y_pred, 0, None)
     return float(np.sqrt(np.mean((np.log1p(y_pred) - np.log1p(y_true)) ** 2)))
 
+
 def mape_safe(y_true, y_pred) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     denom = np.maximum(np.abs(y_true), 1e-9)
     return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
 
-def mase_safe(y_true, y_pred, y_train, seasonality=52) -> float:
+
+def mase_safe(y_true, y_pred, y_train, seasonality: int = 52) -> float:
     """
     MASE = MAE(model) / MAE(naive)
-    naive: seasonal naive with period=52 if possible else lag-1 naive
+
+    Naive baseline:
+    - seasonal naive with period=52 when possible
+    - otherwise a lag-1 naive baseline
     """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -98,10 +116,11 @@ def mase_safe(y_true, y_pred, y_train, seasonality=52) -> float:
         return np.nan
 
     naive_denom = float(np.mean(naive_in)) if len(naive_in) else np.nan
-    if naive_denom is None or np.isnan(naive_denom) or naive_denom < 1e-12:
+    if np.isnan(naive_denom) or naive_denom < 1e-12:
         return np.nan
 
     return float(model_mae / naive_denom)
+
 
 def regression_metrics(y_true, y_pred, y_train_for_mase=None) -> dict:
     y_true = np.asarray(y_true, dtype=float)
@@ -115,11 +134,13 @@ def regression_metrics(y_true, y_pred, y_train_for_mase=None) -> dict:
         "R2": float(r2_score(y_true, y_pred)),
         "MAPE": mape_safe(y_true, y_pred),
     }
-    if y_train_for_mase is not None:
-        out["MASE"] = mase_safe(y_true, y_pred, y_train_for_mase, seasonality=52)
-    else:
-        out["MASE"] = np.nan
+    out["MASE"] = (
+        mase_safe(y_true, y_pred, y_train_for_mase, seasonality=52)
+        if y_train_for_mase is not None
+        else np.nan
+    )
     return out
+
 
 def classification_metrics_from_regression(y_true, y_pred, threshold: float) -> dict:
     y_true = np.asarray(y_true, dtype=float)
@@ -155,32 +176,48 @@ def classification_metrics_from_regression(y_true, y_pred, threshold: float) -> 
         "y_pred_bin": y_pred_bin,
     }
 
-def add_lagged_exog(df: pd.DataFrame, exog_cols, lags=(1, 2, 3, 4)) -> tuple[pd.DataFrame, list[str]]:
+
+def add_lagged_exog(
+    df: pd.DataFrame,
+    exog_cols,
+    lags=(1, 2, 3, 4),
+) -> tuple[pd.DataFrame, list[str]]:
     """
-    Adds lagged vaping regressors (1–4 weeks) per exposé.
-    Returns df + list of lag feature names.
+    Create lag features for each exogenous column.
+
+    Returns:
+      - updated df
+      - list of generated lag column names
     """
     df = df.copy()
-    lag_cols = []
-    for c in exog_cols:
-        for L in lags:
-            name = f"{c}_lag{L}"
-            df[name] = df[c].shift(L)
+    lag_cols: list[str] = []
+
+    for col in exog_cols:
+        for lag in lags:
+            name = f"{col}_lag{lag}"
+            df[name] = df[col].shift(lag)
             lag_cols.append(name)
+
     return df, lag_cols
 
-# =====================================================
-# Delphi Fetch (FluView / ILINet)
-# =====================================================
+
+# -------------------------------------------------------------------
+# Delphi (FluView / ILINet)
+# -------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def fetch_fluview(start_epiweek: int, end_epiweek: int, region: str = "nat") -> pd.DataFrame | None:
+def fetch_fluview(
+    start_epiweek: int,
+    end_epiweek: int,
+    region: str = "nat",
+) -> pd.DataFrame | None:
     url = "https://api.delphi.cmu.edu/epidata/api.php"
     params = {
         "source": "fluview",
         "regions": region,
         "epiweeks": f"{start_epiweek}-{end_epiweek}",
-        "auth": DELPHI_EPIDATA_KEY
+        "auth": DELPHI_EPIDATA_KEY,
     }
+
     r = requests.get(url, params=params, timeout=60)
     data = r.json()
 
@@ -202,28 +239,30 @@ def fetch_fluview(start_epiweek: int, end_epiweek: int, region: str = "nat") -> 
 
     return ensure_weekly(df, "Date")
 
-# =====================================================
-# Load Vaping CSV automatically from same folder
-# =====================================================
+
+# -------------------------------------------------------------------
+# Data loading
+# -------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_vaping_csv() -> pd.DataFrame:
     app_dir = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(app_dir, "vaping_data.csv")
+
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Missing vaping CSV at: {path}\n"
             "Place 'vaping_data.csv' in the same folder as app.py."
         )
+
     df = pd.read_csv(path)
     if "Date" not in df.columns:
         raise ValueError("Vaping CSV must contain a 'Date' column.")
+
     df["Date"] = safe_to_datetime(df["Date"])
     df = df.dropna(subset=["Date"])
     return ensure_weekly(df, "Date")
 
-# =====================================================
-# Load vaping first to determine safe date defaults
-# =====================================================
+
 try:
     vape_all = load_vaping_csv()
 except Exception as e:
@@ -236,38 +275,58 @@ data_max = pd.to_datetime(vape_all["Date"].max())
 default_start = clamp_date(pd.to_datetime("2019-01-01"), data_min, data_max)
 default_end = clamp_date(pd.to_datetime("2023-12-31"), data_min, data_max)
 
-# =====================================================
-# Sidebar Controls
-# =====================================================
+
+# -------------------------------------------------------------------
+# Sidebar controls
+# -------------------------------------------------------------------
 st.sidebar.header("Controls")
-region = st.sidebar.text_input("Delphi FluView region (e.g., nat, hhs1, hhs2...)", value="nat")
+
+region = st.sidebar.text_input(
+    "Delphi FluView region (e.g., nat, hhs1, hhs2...)",
+    value="nat",
+)
 
 start_date = st.sidebar.date_input(
     "Start Date",
     value=default_start.date(),
     min_value=data_min.date(),
-    max_value=data_max.date()
+    max_value=data_max.date(),
 )
 end_date = st.sidebar.date_input(
     "End Date",
     value=default_end.date(),
     min_value=data_min.date(),
-    max_value=data_max.date()
+    max_value=data_max.date(),
 )
 
-horizon = st.sidebar.number_input("Forecast horizon (weeks)", min_value=4, max_value=26, value=8, step=1)
-what_if_pct = st.sidebar.slider("What-if: change vaping demand (%)", min_value=-50, max_value=100, value=0, step=5)
+horizon = st.sidebar.number_input(
+    "Forecast horizon (weeks)",
+    min_value=4,
+    max_value=26,
+    value=8,
+    step=1,
+)
+
+what_if_pct = st.sidebar.slider(
+    "What-if: change vaping demand (%)",
+    min_value=-50,
+    max_value=100,
+    value=0,
+    step=5,
+)
 
 start_ts = pd.to_datetime(start_date)
 end_ts = pd.to_datetime(end_date)
+
 if start_ts > end_ts:
     st.error("Start date must be before end date.")
     st.stop()
 
-# Filter vaping to range
+
+# Filter vaping to date range
 vape = vape_all[(vape_all["Date"] >= start_ts) & (vape_all["Date"] <= end_ts)].copy()
 
-# Fetch ED/ILI
+# Fetch ED/ILI proxy
 start_epi = epiweek_from_date(start_ts)
 end_epi = epiweek_from_date(end_ts)
 ed = fetch_fluview(start_epi, end_epi, region=region)
@@ -280,44 +339,48 @@ ed = ed[(ed["Date"] >= start_ts) & (ed["Date"] <= end_ts)].copy()
 
 master = ensure_weekly(vape.merge(ed, on="Date", how="left"), "Date")
 
-# Exog columns
-vape_exog_cols = [c for c in vape.columns if c != "Date" and pd.api.types.is_numeric_dtype(vape[c])]
-if len(vape_exog_cols) == 0:
+# Identify numeric vaping predictors
+vape_exog_cols = [
+    c for c in vape.columns
+    if c != "Date" and pd.api.types.is_numeric_dtype(vape[c])
+]
+if not vape_exog_cols:
     st.error("No numeric vaping columns found to use as predictors.")
     st.stop()
 
-# Add lagged vaping regressors (1–4 weeks) per exposé
+# Lag features for predictors
 master_lagged, vape_lag_cols = add_lagged_exog(master, vape_exog_cols, lags=(1, 2, 3, 4))
 
-# =====================================================
-# Tabs
-# =====================================================
-tab1, tab2, tab3, tab4 = st.tabs([
-    "1) EDA Summary",
-    "2) Models & Forecasting",
-    "3) Comparison, Seasonality & What-if",
-    "4) Project Guide"
-])
 
-# =====================================================
+# -------------------------------------------------------------------
+# Tabs
+# -------------------------------------------------------------------
+tab1, tab2, tab3, tab4 = st.tabs(
+    [
+        "1) EDA Summary",
+        "2) Models & Forecasting",
+        "3) Comparison, Seasonality & What-if",
+        "4) Project Guide",
+    ]
+)
+
+# =========================
 # TAB 1 — EDA
-# =====================================================
+# =========================
 with tab1:
     st.subheader("EDA: Vaping Dataset, ED/ILI Dataset, and Master Table")
 
     c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Vaping rows", len(vape))
-    with c2: st.metric("ED/ILI rows", len(ed))
-    with c3: st.metric("Master rows", len(master))
+    c1.metric("Vaping rows", len(vape))
+    c2.metric("ED/ILI rows", len(ed))
+    c3.metric("Master rows", len(master))
 
     st.divider()
 
     colL, colR = st.columns(2, gap="large")
-
     with colL:
         st.markdown("### Vaping summary")
         st.dataframe(vape[vape_exog_cols].describe().T, use_container_width=True, height=320)
-
     with colR:
         st.markdown("### ED/ILI summary")
         st.dataframe(ed[["Resp_ED_Proxy"]].describe().T, use_container_width=True, height=320)
@@ -334,11 +397,8 @@ with tab1:
     fig_ed_trend = px.line(ed, x="Date", y="Resp_ED_Proxy", title="ED/ILI proxy trend")
     fig_ed_trend.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
 
-    with colL:
-        st.plotly_chart(fig_vape_trend, use_container_width=True)
-
-    with colR:
-        st.plotly_chart(fig_ed_trend, use_container_width=True)
+    colL.plotly_chart(fig_vape_trend, use_container_width=True)
+    colR.plotly_chart(fig_ed_trend, use_container_width=True)
 
     st.divider()
 
@@ -350,11 +410,8 @@ with tab1:
     fig_ed_hist = px.histogram(ed, x="Resp_ED_Proxy", nbins=40, title="Distribution: ED/ILI proxy")
     fig_ed_hist.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
 
-    with colL:
-        st.plotly_chart(fig_vape_hist, use_container_width=True)
-
-    with colR:
-        st.plotly_chart(fig_ed_hist, use_container_width=True)
+    colL.plotly_chart(fig_vape_hist, use_container_width=True)
+    colR.plotly_chart(fig_ed_hist, use_container_width=True)
 
     st.divider()
 
@@ -362,7 +419,7 @@ with tab1:
     miss = master_lagged.isna().sum().sort_values(ascending=False)
     st.dataframe(miss[miss > 0].to_frame("missing_count"), use_container_width=True)
 
-    st.write("### Correlation heatmap (numeric columns) — including lagged vaping regressors")
+    st.write("### Correlation heatmap (numeric columns incl. lags)")
     corr = master_lagged.drop(columns=["Date"]).corr(numeric_only=True)
     fig_corr = px.imshow(corr, text_auto=False, aspect="auto", title="Correlation heatmap")
     fig_corr.update_layout(height=520, margin=dict(l=10, r=10, t=50, b=10))
@@ -374,11 +431,11 @@ with tab1:
     fig_rel.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig_rel, use_container_width=True)
 
-# =====================================================
+# =========================
 # TAB 2 — Models & Forecasting
-# =====================================================
+# =========================
 with tab2:
-    st.subheader("Models, Error Scores, and Evaluation (Exposé-aligned)")
+    st.subheader("Models, error scores, and evaluation")
 
     dfm_all = master_lagged.dropna(subset=["Resp_ED_Proxy"]).copy()
     dmin = pd.to_datetime(dfm_all["Date"].min())
@@ -386,7 +443,7 @@ with tab2:
     max_train = dmax - pd.Timedelta(weeks=int(horizon))
 
     if max_train <= dmin:
-        st.warning("Not enough data for train/test with the selected horizon. Extend date range.")
+        st.warning("Not enough data for train/test with the selected horizon. Extend the date range.")
         st.stop()
 
     default_model_start = clamp_date(start_ts, dmin, dmax)
@@ -395,13 +452,14 @@ with tab2:
         "Model Start Date (training begins)",
         value=default_model_start.date(),
         min_value=dmin.date(),
-        max_value=dmax.date()
+        max_value=dmax.date(),
     )
+
     train_end = st.date_input(
-        "Training End Date (test next horizon weeks)",
+        "Training End Date (test uses next horizon weeks)",
         value=max_train.date(),
         min_value=dmin.date(),
-        max_value=max_train.date()
+        max_value=max_train.date(),
     )
 
     dfm = dfm_all[dfm_all["Date"] >= pd.to_datetime(model_start)].copy()
@@ -409,44 +467,42 @@ with tab2:
     test = dfm[dfm["Date"] > pd.to_datetime(train_end)].head(int(horizon)).copy()
 
     if len(test) == 0 or len(train) < 60:
-        st.warning("Not enough train/test rows. Choose an earlier training end or wider date range.")
+        st.warning("Not enough train/test rows. Choose an earlier training end or widen the date range.")
         st.stop()
 
     y_train = train["Resp_ED_Proxy"].astype(float)
     y_test = test["Resp_ED_Proxy"].astype(float)
 
-    # Exposé: lagged vaping regressors 1–4 weeks
     exog_cols = vape_lag_cols
     X_train = train[exog_cols].astype(float)
     X_test = test[exog_cols].astype(float)
 
-    # High-demand threshold default = 75th percentile (operational surge detection add-on)
     default_thr = float(np.nanpercentile(y_train.values, 75))
     thr = st.number_input(
-        "High-demand threshold (for Confusion Matrix / AUC — surge-week detection add-on)",
+        "High-demand threshold (for confusion matrix / AUC)",
         value=default_thr,
         help=(
-            "Default is the 75th percentile of TRAINING data (surge weeks). "
-            "This classification section is an operational add-on; the primary thesis task is regression forecasting."
-        )
+            "Default is the 75th percentile of training data. "
+            "This classification view is a secondary operational add-on; the main task is regression forecasting."
+        ),
     )
 
-    # ---- Classification window chooser + auto-expand to try to get both classes ----
+    # Classification evaluation window: try to ensure both classes appear
     avail_df = dfm[dfm["Date"] > pd.to_datetime(train_end)].copy()
     available_after = int(avail_df.shape[0])
-
-    min_clf = int(horizon)
-    max_clf = max(min_clf, min(104, available_after))
 
     if available_after <= 0:
         st.warning("No rows available after Training End Date for classification evaluation.")
         st.stop()
 
+    min_clf = int(horizon)
+    max_clf = max(min_clf, min(104, available_after))
+
     if max_clf == min_clf:
         clf_window = min_clf
         st.info(
             f"Only {available_after} week(s) available after Training End Date, "
-            f"so Classification eval window is fixed at {clf_window}."
+            f"so the classification window is fixed at {clf_window}."
         )
     else:
         clf_window = st.slider(
@@ -454,17 +510,15 @@ with tab2:
             min_value=min_clf,
             max_value=max_clf,
             value=min(52, max_clf),
-            step=1
+            step=1,
         )
 
     chosen = int(clf_window)
     while True:
-        tmp_clf = avail_df.head(chosen)
-        y_tmp = tmp_clf["Resp_ED_Proxy"].astype(float).values
+        tmp = avail_df.head(chosen)
+        y_tmp = tmp["Resp_ED_Proxy"].astype(float).values
         y_bin = (y_tmp >= float(thr)).astype(int)
-        if len(np.unique(y_bin)) == 2:
-            break
-        if chosen >= max_clf:
+        if len(np.unique(y_bin)) == 2 or chosen >= max_clf:
             break
         chosen = min(max_clf, chosen + 4)
 
@@ -478,33 +532,31 @@ with tab2:
     tot_eval = max(1, high_eval + low_eval)
 
     st.caption(
-        f"Classification window used: {len(test_clf)} weeks | "
+        f"Classification window: {len(test_clf)} weeks | "
         f"High={high_eval} ({high_eval/tot_eval:.0%}), Low={low_eval} ({low_eval/tot_eval:.0%}). "
-        "ROC/AUC requires both High and Low weeks."
+        "ROC/AUC requires both classes."
     )
 
-    preds_reg = {}
-    preds_clf = {}
+    preds_reg: dict[str, np.ndarray | None] = {}
+    preds_clf: dict[str, np.ndarray | None] = {}
 
-    with st.spinner("Processing data..... Loading Models....."):
-        # 0) ED-only baseline: SARIMA (no exog) to show exog impact
-        sarima_ok = True
+    with st.spinner("Running models..."):
+        # 0) ED-only baseline
         try:
             sarima = sm.tsa.SARIMAX(
                 y_train,
                 order=(1, 1, 1),
                 seasonal_order=(1, 1, 1, 52),
                 enforce_stationarity=False,
-                enforce_invertibility=False
+                enforce_invertibility=False,
             ).fit(disp=False)
             preds_reg["SARIMA (ED-only)"] = np.asarray(sarima.forecast(steps=len(y_test)))
             preds_clf["SARIMA (ED-only)"] = np.asarray(sarima.forecast(steps=len(y_test_clf)))
         except Exception:
-            sarima_ok = False
             preds_reg["SARIMA (ED-only)"] = None
             preds_clf["SARIMA (ED-only)"] = None
 
-        # 1) Seasonal Naive
+        # 1) Seasonal naive
         season = 52
 
         def seasonal_naive(y_series: pd.Series, n_steps: int) -> np.ndarray:
@@ -517,26 +569,34 @@ with tab2:
         preds_reg["Seasonal Naive"] = seasonal_naive(y_train, len(y_test))
         preds_clf["Seasonal Naive"] = seasonal_naive(y_train, len(y_test_clf))
 
-        # 2) SARIMAX (with lagged vaping exog)
+        # 2) SARIMAX with exogenous lag features
         try:
             sarimax = sm.tsa.SARIMAX(
-                y_train, exog=X_train,
+                y_train,
+                exog=X_train,
                 order=(1, 1, 1),
                 seasonal_order=(1, 1, 1, 52),
                 enforce_stationarity=False,
-                enforce_invertibility=False
+                enforce_invertibility=False,
             ).fit(disp=False)
-
-            preds_reg["SARIMAX (ED + vaping lags)"] = np.asarray(sarimax.forecast(steps=len(y_test), exog=X_test))
-            preds_clf["SARIMAX (ED + vaping lags)"] = np.asarray(sarimax.forecast(steps=len(y_test_clf), exog=X_test_clf))
+            preds_reg["SARIMAX (ED + vaping lags)"] = np.asarray(
+                sarimax.forecast(steps=len(y_test), exog=X_test)
+            )
+            preds_clf["SARIMAX (ED + vaping lags)"] = np.asarray(
+                sarimax.forecast(steps=len(y_test_clf), exog=X_test_clf)
+            )
         except Exception:
             preds_reg["SARIMAX (ED + vaping lags)"] = None
             preds_clf["SARIMAX (ED + vaping lags)"] = None
 
-        # 3) Prophet (with lagged vaping regressors)
+        # 3) Prophet (optional)
         if PROPHET_AVAILABLE:
             try:
-                dfp = train[["Date", "Resp_ED_Proxy"] + exog_cols].copy().rename(columns={"Date": "ds", "Resp_ED_Proxy": "y"})
+                dfp = (
+                    train[["Date", "Resp_ED_Proxy"] + exog_cols]
+                    .copy()
+                    .rename(columns={"Date": "ds", "Resp_ED_Proxy": "y"})
+                )
                 m = Prophet(weekly_seasonality=True, yearly_seasonality=True, daily_seasonality=False)
                 for c in exog_cols:
                     m.add_regressor(c)
@@ -554,7 +614,7 @@ with tab2:
             preds_reg["Prophet (not installed)"] = None
             preds_clf["Prophet (not installed)"] = None
 
-        # 4) Gradient Boosting (target lags + vaping lags)
+        # 4) Gradient Boosting (target lags + exog lags)
         try:
             tmp = dfm[["Date", "Resp_ED_Proxy"] + exog_cols].copy().sort_values("Date")
             tmp["y_lag1"] = tmp["Resp_ED_Proxy"].shift(1)
@@ -563,8 +623,8 @@ with tab2:
             tmp = tmp.dropna()
 
             tmp_train = tmp[tmp["Date"] <= pd.to_datetime(train_end)]
-            tmp_test_reg = tmp[(tmp["Date"] > pd.to_datetime(train_end))].head(int(horizon))
-            tmp_test_clf = tmp[(tmp["Date"] > pd.to_datetime(train_end))].head(int(len(test_clf)))
+            tmp_test_reg = tmp[tmp["Date"] > pd.to_datetime(train_end)].head(int(horizon))
+            tmp_test_clf = tmp[tmp["Date"] > pd.to_datetime(train_end)].head(int(len(test_clf)))
 
             feat_cols = ["y_lag1", "y_lag2", "y_lag4"] + exog_cols
             gbr = GradientBoostingRegressor(random_state=42)
@@ -576,12 +636,12 @@ with tab2:
             preds_reg["Gradient Boosting (lags + exog lags)"] = None
             preds_clf["Gradient Boosting (lags + exog lags)"] = None
 
-    # Build metrics per model
+    # Metrics summary
     results = []
     for name, yhat_reg in preds_reg.items():
         if yhat_reg is None:
             continue
-        yhat_clf = preds_clf.get(name, None)
+        yhat_clf = preds_clf.get(name)
         if yhat_clf is None:
             continue
 
@@ -589,67 +649,81 @@ with tab2:
         reg = regression_metrics(
             y_test.values[:n_reg],
             np.asarray(yhat_reg)[:n_reg],
-            y_train_for_mase=y_train.values
+            y_train_for_mase=y_train.values,
         )
 
         n_clf = min(len(y_test_clf), len(yhat_clf))
         clf = classification_metrics_from_regression(
             y_test_clf.values[:n_clf],
             np.asarray(yhat_clf)[:n_clf],
-            threshold=float(thr)
+            threshold=float(thr),
         )
 
-        results.append({
-            "Model": name,
-            **reg,
-            "Accuracy": clf["accuracy"],
-            "Precision": clf["precision"],
-            "Recall": clf["recall"],
-            "AUC": clf["auc"],
-        })
+        results.append(
+            {
+                "Model": name,
+                **reg,
+                "Accuracy": clf["accuracy"],
+                "Precision": clf["precision"],
+                "Recall": clf["recall"],
+                "AUC": clf["auc"],
+            }
+        )
 
     if not results:
-        st.error("No models produced predictions. Check date range / missing values / optional installs.")
+        st.error("No models produced predictions. Check date range, missing values, and optional installs.")
         st.stop()
 
     results_df = pd.DataFrame(results).sort_values("RMSE", ascending=True).reset_index(drop=True)
     best_model = results_df.iloc[0]["Model"]
     st.success(f"Best model (lowest RMSE): **{best_model}**")
 
-    st.write("### Regression metrics (exposé): RMSE, MAE, MAPE, MASE (+ extras)")
-    st.dataframe(results_df[["Model", "MAE", "RMSE", "MAPE", "MASE", "MSE", "RMSLE", "R2"]], use_container_width=True)
+    st.write("### Regression metrics")
+    st.dataframe(
+        results_df[["Model", "MAE", "RMSE", "MAPE", "MASE", "MSE", "RMSLE", "R2"]],
+        use_container_width=True,
+    )
 
-    st.write("### Model Comparison Chart (RMSE)")
+    st.write("### RMSE by model")
     st.plotly_chart(px.bar(results_df, x="Model", y="RMSE", title="RMSE by Model (best first)"), use_container_width=True)
 
-    # Exog impact: SARIMA vs SARIMAX
-    st.write("### Impact of vaping exogenous data (ED-only vs ED+vaping lags)")
+    st.write("### ED-only vs ED+vaping lags")
     impact_cols = ["Model", "RMSE", "MAE", "MAPE", "MASE"]
-    impact_df = results_df[results_df["Model"].isin(["SARIMA (ED-only)", "SARIMAX (ED + vaping lags)"])][impact_cols].copy()
+    impact_df = results_df[
+        results_df["Model"].isin(["SARIMA (ED-only)", "SARIMAX (ED + vaping lags)"])
+    ][impact_cols].copy()
+
     if impact_df.shape[0] == 2:
         st.dataframe(impact_df, use_container_width=True)
         st.plotly_chart(px.bar(impact_df, x="Model", y="RMSE", title="ED-only vs ED+vaping lags (RMSE)"), use_container_width=True)
     else:
-        st.info("Impact comparison not available (SARIMA or SARIMAX failed for current selection).")
+        st.info("Impact comparison not available (SARIMA or SARIMAX failed for the current selection).")
 
     st.divider()
 
-    st.write("### Forecast vs Actual (Test Window / Horizon) — best model")
+    st.write("### Forecast vs Actual (test horizon)")
     best_pred_reg = preds_reg[best_model]
     n_reg = min(len(y_test), len(best_pred_reg))
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=test["Date"].iloc[:n_reg], y=y_test.iloc[:n_reg], mode="lines+markers", name="Actual"))
-    fig.add_trace(go.Scatter(x=test["Date"].iloc[:n_reg], y=np.asarray(best_pred_reg)[:n_reg], mode="lines+markers", name=f"Forecast ({best_model})"))
+    fig.add_trace(
+        go.Scatter(
+            x=test["Date"].iloc[:n_reg],
+            y=np.asarray(best_pred_reg)[:n_reg],
+            mode="lines+markers",
+            name=f"Forecast ({best_model})",
+        )
+    )
     fig.update_layout(title=f"Forecast vs Actual — {best_model}", xaxis_title="Date", yaxis_title="Resp_ED_Proxy")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.write("### Confusion Matrix + ROC/AUC (Best model) — surge-week detection add-on")
+    st.write("### Confusion matrix + ROC/AUC (best model)")
     best_pred_clf = preds_clf[best_model]
     n_clf = min(len(y_test_clf), len(best_pred_clf))
     clf_best = classification_metrics_from_regression(
         y_test_clf.values[:n_clf],
         np.asarray(best_pred_clf)[:n_clf],
-        threshold=float(thr)
+        threshold=float(thr),
     )
 
     cm = clf_best["confusion_matrix"]
@@ -661,39 +735,43 @@ with tab2:
 
     if clf_best["roc_fpr"] is not None and not np.isnan(clf_best["auc"]):
         fig_roc = go.Figure()
-        fig_roc.add_trace(go.Scatter(x=clf_best["roc_fpr"], y=clf_best["roc_tpr"], mode="lines",
-                                     name=f"ROC (AUC={clf_best['auc']:.3f})"))
+        fig_roc.add_trace(
+            go.Scatter(
+                x=clf_best["roc_fpr"],
+                y=clf_best["roc_tpr"],
+                mode="lines",
+                name=f"ROC (AUC={clf_best['auc']:.3f})",
+            )
+        )
         fig_roc.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random", line=dict(dash="dash")))
         fig_roc.update_layout(title="ROC Curve (Best model)", xaxis_title="False Positive Rate", yaxis_title="True Positive Rate")
         st.plotly_chart(fig_roc, use_container_width=True)
     else:
         st.info(
             "ROC/AUC needs both classes present in the evaluation window. "
-            "Even after auto-expansion, only one class exists here. "
-            "Try expanding overall date range or adjusting the threshold."
+            "Try expanding the overall date range or adjusting the threshold."
         )
 
     st.divider()
 
-    st.write(f"### Upcoming {int(horizon)}-Week Forecast (after Training End Date) — using best available model")
+    st.write(f"### Next {int(horizon)}-week forecast (post training end)")
     future_dates = pd.date_range(pd.to_datetime(train_end) + pd.Timedelta(days=7), periods=int(horizon), freq="W-SUN")
 
-    # For future exog, use last available lag-feature row repeated (simple operational assumption)
-    last_row = train.iloc[-1]
-    last_exog = last_row[exog_cols].astype(float).values
+    # Simple operational assumption: hold exog lags constant at last training row
+    last_exog = train.iloc[-1][exog_cols].astype(float).values
     X_future = pd.DataFrame([last_exog] * int(horizon), columns=exog_cols, index=future_dates)
 
     future_pred = None
 
-    # Prefer SARIMAX future if available (uses exog)
-    if "SARIMAX (ED + vaping lags)" in preds_reg and preds_reg["SARIMAX (ED + vaping lags)"] is not None:
+    if preds_reg.get("SARIMAX (ED + vaping lags)") is not None:
         try:
             sarimax_full = sm.tsa.SARIMAX(
-                y_train, exog=X_train,
+                y_train,
+                exog=X_train,
                 order=(1, 1, 1),
                 seasonal_order=(1, 1, 1, 52),
                 enforce_stationarity=False,
-                enforce_invertibility=False
+                enforce_invertibility=False,
             ).fit(disp=False)
             future_pred = sarimax_full.forecast(steps=int(horizon), exog=X_future)
         except Exception:
@@ -704,18 +782,27 @@ with tab2:
 
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=train["Date"].tail(52), y=y_train.tail(52), mode="lines", name="History (last 52w)"))
-    fig2.add_trace(go.Scatter(x=future_dates, y=future_pred, mode="lines+markers", name="Future Forecast"))
+    fig2.add_trace(go.Scatter(x=future_dates, y=future_pred, mode="lines+markers", name="Forecast"))
     fig2.update_layout(title=f"Future Forecast (next {int(horizon)} weeks)", xaxis_title="Date", yaxis_title="Resp_ED_Proxy")
     st.plotly_chart(fig2, use_container_width=True)
 
-# =====================================================
-# TAB 3 — Rolling CV + Trend/Seasonality + What-if
-# =====================================================
+# =========================
+# TAB 3 — Rolling CV + Seasonality + What-if
+# =========================
 @st.cache_data(show_spinner=False)
-def rolling_origin_cv(df: pd.DataFrame, exog_cols: list[str], horizon: int, initial_train_weeks: int, step_weeks: int, max_folds: int, include_prophet: bool):
+def rolling_origin_cv(
+    df: pd.DataFrame,
+    exog_cols: list[str],
+    horizon: int,
+    initial_train_weeks: int,
+    step_weeks: int,
+    max_folds: int,
+    include_prophet: bool,
+) -> pd.DataFrame:
     """
-    Rolling-origin cross-validation per exposé.
-    Returns fold-level metrics per model.
+    Rolling-origin cross-validation.
+
+    Returns a fold-level metrics table for each model.
     """
     df = df.dropna(subset=["Resp_ED_Proxy"]).copy().sort_values("Date")
     df = df.dropna(subset=exog_cols).copy()
@@ -723,22 +810,27 @@ def rolling_origin_cv(df: pd.DataFrame, exog_cols: list[str], horizon: int, init
     if df.shape[0] < initial_train_weeks + horizon + 5:
         return pd.DataFrame()
 
-    models = ["Seasonal Naive", "SARIMA (ED-only)", "SARIMAX (ED + vaping lags)", "Gradient Boosting (lags + exog lags)"]
+    models = [
+        "Seasonal Naive",
+        "SARIMA (ED-only)",
+        "SARIMAX (ED + vaping lags)",
+        "Gradient Boosting (lags + exog lags)",
+    ]
     if include_prophet and PROPHET_AVAILABLE:
         models.append("Prophet (ED + vaping lags)")
 
     rows = []
     season = 52
 
-    def seasonal_naive(y_series: np.ndarray, n_steps: int) -> np.ndarray:
-        if len(y_series) >= season:
-            base = y_series[-season:]
+    def seasonal_naive(arr: np.ndarray, n_steps: int) -> np.ndarray:
+        if len(arr) >= season:
+            base = arr[-season:]
             reps = int(np.ceil(n_steps / len(base)))
             return np.tile(base, reps)[:n_steps]
-        return np.repeat(float(y_series[-1]), n_steps)
+        return np.repeat(float(arr[-1]), n_steps)
 
     fold = 0
-    start_train_end = initial_train_weeks - 1  # index
+    start_train_end = initial_train_weeks - 1
 
     while True:
         train_end_idx = start_train_end + fold * step_weeks
@@ -747,23 +839,22 @@ def rolling_origin_cv(df: pd.DataFrame, exog_cols: list[str], horizon: int, init
 
         if test_end > df.shape[0]:
             break
+
         fold += 1
         if fold > max_folds:
             break
 
-        train = df.iloc[: test_start].copy()
+        train = df.iloc[:test_start].copy()
         test = df.iloc[test_start:test_end].copy()
 
         y_train = train["Resp_ED_Proxy"].astype(float).values
         y_test = test["Resp_ED_Proxy"].astype(float).values
-
         X_train = train[exog_cols].astype(float).values
         X_test = test[exog_cols].astype(float).values
 
         # Seasonal naive
         yhat = seasonal_naive(y_train, horizon)
-        m = regression_metrics(y_test, yhat, y_train_for_mase=y_train)
-        rows.append({"Fold": fold, "Model": "Seasonal Naive", **m})
+        rows.append({"Fold": fold, "Model": "Seasonal Naive", **regression_metrics(y_test, yhat, y_train)})
 
         # SARIMA (ED-only)
         try:
@@ -772,26 +863,25 @@ def rolling_origin_cv(df: pd.DataFrame, exog_cols: list[str], horizon: int, init
                 order=(1, 1, 1),
                 seasonal_order=(1, 1, 1, 52),
                 enforce_stationarity=False,
-                enforce_invertibility=False
+                enforce_invertibility=False,
             ).fit(disp=False)
             yhat = np.asarray(sarima.forecast(steps=horizon))
-            m = regression_metrics(y_test, yhat, y_train_for_mase=y_train)
-            rows.append({"Fold": fold, "Model": "SARIMA (ED-only)", **m})
+            rows.append({"Fold": fold, "Model": "SARIMA (ED-only)", **regression_metrics(y_test, yhat, y_train)})
         except Exception:
             pass
 
         # SARIMAX
         try:
             sarimax = sm.tsa.SARIMAX(
-                y_train, exog=X_train,
+                y_train,
+                exog=X_train,
                 order=(1, 1, 1),
                 seasonal_order=(1, 1, 1, 52),
                 enforce_stationarity=False,
-                enforce_invertibility=False
+                enforce_invertibility=False,
             ).fit(disp=False)
             yhat = np.asarray(sarimax.forecast(steps=horizon, exog=X_test))
-            m = regression_metrics(y_test, yhat, y_train_for_mase=y_train)
-            rows.append({"Fold": fold, "Model": "SARIMAX (ED + vaping lags)", **m})
+            rows.append({"Fold": fold, "Model": "SARIMAX (ED + vaping lags)", **regression_metrics(y_test, yhat, y_train)})
         except Exception:
             pass
 
@@ -807,24 +897,27 @@ def rolling_origin_cv(df: pd.DataFrame, exog_cols: list[str], horizon: int, init
             gbr = GradientBoostingRegressor(random_state=42)
             gbr.fit(tmp[feat_cols].values, tmp["Resp_ED_Proxy"].values)
 
-            # Build test features with target lags using full df
             tmp2 = df.iloc[:test_end].copy()
             tmp2["y_lag1"] = tmp2["Resp_ED_Proxy"].shift(1)
             tmp2["y_lag2"] = tmp2["Resp_ED_Proxy"].shift(2)
             tmp2["y_lag4"] = tmp2["Resp_ED_Proxy"].shift(4)
             tmp2 = tmp2.dropna(subset=feat_cols + ["Resp_ED_Proxy"])
             ttest = tmp2[tmp2["Date"].isin(test["Date"])].copy()
+
             if ttest.shape[0] == horizon:
                 yhat = gbr.predict(ttest[feat_cols].values)
-                m = regression_metrics(y_test, yhat, y_train_for_mase=y_train)
-                rows.append({"Fold": fold, "Model": "Gradient Boosting (lags + exog lags)", **m})
+                rows.append({"Fold": fold, "Model": "Gradient Boosting (lags + exog lags)", **regression_metrics(y_test, yhat, y_train)})
         except Exception:
             pass
 
-        # Prophet optional (slow)
+        # Prophet (optional)
         if include_prophet and PROPHET_AVAILABLE:
             try:
-                dfp = train[["Date", "Resp_ED_Proxy"] + exog_cols].copy().rename(columns={"Date": "ds", "Resp_ED_Proxy": "y"})
+                dfp = (
+                    train[["Date", "Resp_ED_Proxy"] + exog_cols]
+                    .copy()
+                    .rename(columns={"Date": "ds", "Resp_ED_Proxy": "y"})
+                )
                 mprop = Prophet(weekly_seasonality=True, yearly_seasonality=True, daily_seasonality=False)
                 for c in exog_cols:
                     mprop.add_regressor(c)
@@ -832,18 +925,18 @@ def rolling_origin_cv(df: pd.DataFrame, exog_cols: list[str], horizon: int, init
 
                 future = test[["Date"] + exog_cols].copy().rename(columns={"Date": "ds"})
                 yhat = mprop.predict(future)["yhat"].values
-                m = regression_metrics(y_test, yhat, y_train_for_mase=y_train)
-                rows.append({"Fold": fold, "Model": "Prophet (ED + vaping lags)", **m})
+                rows.append({"Fold": fold, "Model": "Prophet (ED + vaping lags)", **regression_metrics(y_test, yhat, y_train)})
             except Exception:
                 pass
 
     return pd.DataFrame(rows)
 
-with tab3:
-    st.subheader("Model Comparison (Rolling-Origin CV) + Trends/Seasonality + What-if")
 
-    st.markdown("### Rolling-origin cross-validation (per exposé)")
-    st.caption("This backtests models across multiple train/test splits to estimate stable out-of-sample performance.")
+with tab3:
+    st.subheader("Rolling CV + trends/seasonality + what-if")
+
+    st.markdown("### Rolling-origin cross-validation")
+    st.caption("Backtests models across multiple train/test splits to estimate out-of-sample performance.")
 
     cv_col1, cv_col2, cv_col3, cv_col4 = st.columns(4)
     with cv_col1:
@@ -855,7 +948,7 @@ with tab3:
     with cv_col4:
         include_prophet = st.checkbox("Include Prophet in CV (slower)", value=False)
 
-    with st.spinner("Processing data..... Running rolling-origin CV....."):
+    with st.spinner("Running rolling CV..."):
         cv_df = rolling_origin_cv(
             master_lagged.copy(),
             exog_cols=vape_lag_cols,
@@ -863,18 +956,18 @@ with tab3:
             initial_train_weeks=int(initial_train_weeks),
             step_weeks=int(step_weeks),
             max_folds=int(max_folds),
-            include_prophet=bool(include_prophet)
+            include_prophet=bool(include_prophet),
         )
 
     if cv_df.empty:
-        st.warning("Not enough data for rolling-origin CV with current settings. Try smaller initial train or larger date range.")
+        st.warning("Not enough data for rolling-origin CV with current settings. Try smaller initial train or a wider date range.")
     else:
         st.write("#### Fold-level results")
-        st.dataframe(cv_df[["Fold","Model","RMSE","MAE","MAPE","MASE","R2"]].sort_values(["Model","Fold"]), use_container_width=True)
+        st.dataframe(cv_df[["Fold", "Model", "RMSE", "MAE", "MAPE", "MASE", "R2"]].sort_values(["Model", "Fold"]), use_container_width=True)
 
-        st.write("#### CV Summary (mean across folds)")
+        st.write("#### CV summary (mean across folds)")
         cv_summary = (
-            cv_df.groupby("Model", as_index=False)[["RMSE","MAE","MAPE","MASE","R2"]]
+            cv_df.groupby("Model", as_index=False)[["RMSE", "MAE", "MAPE", "MASE", "R2"]]
             .mean()
             .sort_values("RMSE", ascending=True)
         )
@@ -884,11 +977,11 @@ with tab3:
         st.plotly_chart(px.box(cv_df, x="Model", y="MAPE", title="Rolling CV MAPE distribution by model"), use_container_width=True)
 
         best_cv = cv_summary.iloc[0]["Model"]
-        st.success(f"Best model by Rolling-CV RMSE: **{best_cv}**")
+        st.success(f"Best model by rolling-CV RMSE: **{best_cv}**")
 
     st.divider()
 
-    st.subheader("Trends and Seasonality (with explanations)")
+    st.subheader("Trends and seasonality")
     series = master.dropna(subset=["Resp_ED_Proxy"]).set_index("Date")["Resp_ED_Proxy"].asfreq("W-SUN")
 
     if series.dropna().shape[0] < 120:
@@ -897,7 +990,7 @@ with tab3:
         decomp = seasonal_decompose(series, model="additive", period=52)
 
         trend = decomp.trend.dropna()
-        st.plotly_chart(px.line(x=trend.index, y=trend.values, title="Trend Component"), use_container_width=True)
+        st.plotly_chart(px.line(x=trend.index, y=trend.values, title="Trend component"), use_container_width=True)
 
         if len(trend) >= 12:
             recent = trend.iloc[-12:]
@@ -906,14 +999,14 @@ with tab3:
             st.markdown(
                 f"""
 **Trend summary**
-- The long-run level is **{direction}** over the most recent ~12 weeks.
-- Average change/week (trend component): **{slope:.4f}**.
-- Latest trend level: **{float(recent.iloc[-1]):.4f}**.
+- Recent direction (~12 weeks): **{direction}**
+- Avg. change/week (trend component): **{slope:.4f}**
+- Latest trend level: **{float(recent.iloc[-1]):.4f}**
                 """.strip()
             )
 
         seasonal = decomp.seasonal.dropna()
-        st.plotly_chart(px.line(x=seasonal.index, y=seasonal.values, title="Seasonality Component (period=52)"), use_container_width=True)
+        st.plotly_chart(px.line(x=seasonal.index, y=seasonal.values, title="Seasonality component (period=52)"), use_container_width=True)
 
         amp = float(seasonal.max() - seasonal.min())
         peak_date = seasonal.idxmax()
@@ -921,16 +1014,15 @@ with tab3:
         st.markdown(
             f"""
 **Seasonality summary**
-- Peak-to-trough seasonal swing: **{amp:.4f}**.
-- Seasonal peak around: **{peak_date.date()}**.
-- Seasonal low around: **{trough_date.date()}**.
-- Interpretation: repeating yearly pattern (e.g., winter respiratory season effects).
+- Peak-to-trough swing: **{amp:.4f}**
+- Peak around: **{peak_date.date()}**
+- Low around: **{trough_date.date()}**
             """.strip()
         )
 
     st.divider()
 
-    st.subheader("What-if: changing demand% (vaping predictors) and what it does")
+    st.subheader("What-if: changing vaping demand signals")
 
     dfw = master_lagged.dropna(subset=["Resp_ED_Proxy"] + vape_exog_cols).copy()
     y = dfw["Resp_ED_Proxy"].astype(float)
@@ -940,33 +1032,31 @@ with tab3:
     last_date = dfw["Date"].max()
     future_dates = pd.date_range(last_date + pd.Timedelta(days=7), periods=h, freq="W-SUN")
 
-    # Simple what-if: scale raw vaping signals then rebuild lagged features from last known state
     scale = 1.0 + (what_if_pct / 100.0)
     last_raw = X_base_raw.iloc[-1] * scale
+    _ = pd.DataFrame([last_raw.values] * h, columns=vape_exog_cols, index=future_dates)  # kept for clarity
 
-    # Build future raw (constant) and then lag features (constant as operational approximation)
-    future_raw = pd.DataFrame([last_raw.values] * h, columns=vape_exog_cols, index=future_dates)
-
-    # Lagged features for future: use last available lag row repeated
     last_lag_row = dfw.iloc[-1][vape_lag_cols].astype(float).values
     X_future_lags = pd.DataFrame([last_lag_row] * h, columns=vape_lag_cols, index=future_dates)
 
-    with st.spinner("Processing data..... Loading Models....."):
-        baseline_fc = None
-        scenario_fc = None
+    baseline_fc = None
+    scenario_fc = None
+    with st.spinner("Building what-if forecast..."):
         try:
-            # Fit SARIMAX on full data with lagged exog
             X_full = dfw[vape_lag_cols].astype(float)
             sar = sm.tsa.SARIMAX(
-                y, exog=X_full,
+                y,
+                exog=X_full,
                 order=(1, 1, 1),
                 seasonal_order=(1, 1, 1, 52),
                 enforce_stationarity=False,
-                enforce_invertibility=False
+                enforce_invertibility=False,
             ).fit(disp=False)
 
-            # Baseline: use last lag row repeated (operational)
-            baseline_fc = sar.forecast(steps=h, exog=pd.DataFrame([dfw.iloc[-1][vape_lag_cols].astype(float).values]*h, columns=vape_lag_cols))
+            baseline_fc = sar.forecast(
+                steps=h,
+                exog=pd.DataFrame([dfw.iloc[-1][vape_lag_cols].astype(float).values] * h, columns=vape_lag_cols),
+            )
             scenario_fc = sar.forecast(steps=h, exog=X_future_lags.values)
         except Exception:
             baseline_fc = None
@@ -979,31 +1069,25 @@ with tab3:
         fig.add_trace(go.Scatter(x=dfw["Date"].tail(52), y=y.tail(52), mode="lines", name="History (last 52w)"))
         fig.add_trace(go.Scatter(x=future_dates, y=baseline_fc, mode="lines+markers", name="Baseline forecast"))
         fig.add_trace(go.Scatter(x=future_dates, y=scenario_fc, mode="lines+markers", name=f"What-if forecast ({what_if_pct:+d}%)"))
-        fig.update_layout(title="What-if Forecast Update (updates as slider moves)", xaxis_title="Date", yaxis_title="Resp_ED_Proxy")
+        fig.update_layout(title="What-if forecast (updates as slider moves)", xaxis_title="Date", yaxis_title="Resp_ED_Proxy")
         st.plotly_chart(fig, use_container_width=True)
 
         delta = np.asarray(scenario_fc) - np.asarray(baseline_fc)
         avg_delta = float(np.mean(delta))
         pct_change = float(np.mean(delta) / (np.mean(baseline_fc) + 1e-9) * 100.0)
 
-        direction = "increase" if what_if_pct > 0 else ("decrease" if what_if_pct < 0 else "no change")
         st.markdown(
             f"""
 **What-if summary (Demand% = {what_if_pct:+d}%):**
-- We scaled vaping demand signals by **{scale:.2f}×** (a {direction} assumption).
-- The SARIMAX model shifts the ED/ILI forecast according to learned relationships with vaping lags.
-- Average forecast change over next {h} weeks: **{avg_delta:+.4f}**.
-- Avg. percentage change vs baseline forecast: **{pct_change:+.2f}%**.
-
-**Interpretation**
-- If vaping lags have a positive learned association with ED/ILI, increasing demand% pushes forecasts upward.
-- If association is negative, increasing demand% can reduce forecasts.
+- Vaping demand signals scaled by **{scale:.2f}×**
+- Avg. forecast change over next {h} weeks: **{avg_delta:+.4f}**
+- Avg. % change vs baseline: **{pct_change:+.2f}%**
             """.strip()
         )
 
-# =====================================================
-# TAB 4 — GUIDE
-# =====================================================
+# =========================
+# TAB 4 — Guide
+# =========================
 with tab4:
     st.subheader("Project Description & How to Use the Dashboard")
     st.markdown(
@@ -1011,27 +1095,26 @@ with tab4:
 ### Goal
 Forecast respiratory ED demand proxy (ILINet weighted ILI / ILI via Delphi FluView) using vaping sales as potential leading indicators.
 
-### Modeling choices
-- Uses **lagged vaping regressors (1–4 weeks)** to capture potential leading effects.
-- Includes **ED-only baseline (SARIMA)** vs **ED+vaping (SARIMAX)** to show incremental value.
-- Evaluates models with **rolling-origin cross-validation** (Tab 3) for stable out-of-sample comparisons.
+### Modeling
+- Lagged vaping regressors (1–4 weeks) to capture lead effects.
+- ED-only baseline (SARIMA) vs ED+vaping (SARIMAX) to show incremental value.
+- Rolling-origin cross-validation (Tab 3) for more stable out-of-sample comparisons.
 
 ### Metrics
-Primary (exposé):
-- **RMSE**, **MAE**, **MAPE**, **MASE**
+Primary:
+- RMSE, MAE, MAPE, MASE
 
 Additional:
 - MSE, RMSLE, R²
 
-### Classification add-on (optional operational view)
-- Converts continuous demand into **High vs Low demand** using a threshold (default: 75th percentile of training).
-- Shows confusion matrix / accuracy / precision / recall / ROC-AUC.
-- ROC-AUC requires both classes in the evaluation window.
+### Classification add-on
+- Converts continuous demand into High vs Low using a threshold (default: 75th percentile of training).
+- Confusion matrix + accuracy/precision/recall + ROC-AUC (requires both classes).
 
 ### Tabs
 1) EDA — trends, distributions, correlations  
 2) Models — forecasts + errors + ED-only vs ED+vaping impact  
-3) Rolling CV + Trend/Seasonality + What-if simulations  
-4) Guide — what metrics/components mean
+3) Rolling CV + trend/seasonality + what-if simulations  
+4) Guide — overview and definitions
 """
     )
